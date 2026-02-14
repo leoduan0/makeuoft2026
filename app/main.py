@@ -1,11 +1,11 @@
 import json
 import os
 import sys
-import tempfile
 import threading
 from dataclasses import dataclass
 from typing import Dict, Optional
 
+from dotenv import load_dotenv
 import serial
 from serial.tools import list_ports
 from PySide6.QtCore import QObject, QThread, Qt, QUrl, Signal, Slot
@@ -22,8 +22,10 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from elevenlabs import VoiceSettings
 from elevenlabs.client import ElevenLabs
+from elevenlabs.play import play
+
+load_dotenv()
 
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 ELEVENLABS_VOICE_ID = "pNInz6obpgDQGcFmaJgB"  # adam
@@ -51,14 +53,14 @@ class SerialReader(QObject):
     readings = Signal(int, int, int, float, float, float, float, float, float)
     status = Signal(str)
 
-    def __init__(self, port: str, baud: int) -> None:
+    def __init__(self, port: str, baud: int):
         super().__init__()
         self._port = port
         self._baud = baud
         self._running = False
         self._ser: Optional[serial.Serial] = None
 
-    def start(self) -> None:
+    def start(self):
         self._running = True
         try:
             self._ser = serial.Serial(self._port, self._baud, timeout=0.1)
@@ -107,7 +109,7 @@ class SerialReader(QObject):
             except Exception:
                 pass
 
-    def stop(self) -> None:
+    def stop(self):
         self._running = False
 
 
@@ -115,55 +117,32 @@ class TTSSpeaker(QObject):
     audio_ready = Signal(str)
     status = Signal(str)
 
-    def __init__(self) -> None:
+    def __init__(self):
         super().__init__()
-        self._cache: Dict[str, str] = {}
+        self._cache = {}
         self._lock = threading.Lock()
-        self._client: ElevenLabs
+        self._client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
 
     @Slot(str)
-    def speak(self, text: str) -> None:
-        if not ELEVENLABS_API_KEY:
-            self.status.emit("Missing ELEVENLABS_API_KEY")
-            return
-        if self._client is None:
-            self._client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
-        assert self._client is not None
+    def speak(self, text: str):
         with self._lock:
             if text in self._cache:
                 self.audio_ready.emit(self._cache[text])
                 return
-        try:
-            response = self._client.text_to_speech.stream(
-                voice_id=ELEVENLABS_VOICE_ID,
-                output_format="mp3_22050_32",
-                text=text,
-                model_id="eleven_multilingual_v2",
-                voice_settings=VoiceSettings(
-                    stability=0.5,
-                    similarity_boost=0.75,
-                    style=0.0,
-                    use_speaker_boost=True,
-                    speed=1.0,
-                ),
-            )
-            temp_dir = tempfile.gettempdir()
-            file_path = os.path.join(temp_dir, f"elevenlabs_{hash(text)}.mp3")
-            with open(file_path, "wb") as handle:
-                for chunk in response:
-                    if chunk:
-                        handle.write(chunk)
-            with self._lock:
-                self._cache[text] = file_path
-            self.audio_ready.emit(file_path)
-        except Exception as exc:
-            self.status.emit(f"TTS failed: {exc}")
+
+        audio = self._client.text_to_speech.stream(
+            text=text,
+            voice_id=ELEVENLABS_VOICE_ID,
+            model_id="eleven_multilingual_v2",
+            output_format="mp3_44100_128",
+        )
+        play(audio)
 
 
 class MainWindow(QMainWindow):
     tts_request = Signal(str)
 
-    def __init__(self) -> None:
+    def __init__(self):
         super().__init__()
         self.setWindowTitle("Flex Sensor Calibration")
         self._last_values = (0, 0, 0)
@@ -190,7 +169,7 @@ class MainWindow(QMainWindow):
         self._setup_tts_worker()
         self._connect_serial()
 
-    def _build_ui(self) -> None:
+    def _build_ui(self):
         root = QWidget()
         layout = QVBoxLayout(root)
 
@@ -256,12 +235,12 @@ class MainWindow(QMainWindow):
         self.start_button.clicked.connect(self._start_calibration)
         self.capture_button.clicked.connect(self._capture_step)
 
-    def _setup_audio(self) -> None:
+    def _setup_audio(self):
         self.player = QMediaPlayer(self)
         self.audio_output = QAudioOutput(self)
         self.player.setAudioOutput(self.audio_output)
 
-    def _setup_tts_worker(self) -> None:
+    def _setup_tts_worker(self):
         self.tts_thread = QThread(self)
         self.tts_worker = TTSSpeaker()
         self.tts_worker.moveToThread(self.tts_thread)
@@ -272,7 +251,7 @@ class MainWindow(QMainWindow):
             self.tts_worker.speak, Qt.ConnectionType.QueuedConnection
         )
 
-    def _connect_serial(self) -> None:
+    def _connect_serial(self):
         port = self._detect_port()
         if not port:
             self._set_status("No serial port found. Connect Arduino and restart.")
@@ -285,7 +264,7 @@ class MainWindow(QMainWindow):
         self.serial_worker.status.connect(self._set_status)
         self.serial_thread.start()
 
-    def _detect_port(self) -> Optional[str]:
+    def _detect_port(self):
         ports = list(list_ports.comports())
         if not ports:
             return None
@@ -311,7 +290,7 @@ class MainWindow(QMainWindow):
         avg_ax: float,
         avg_ay: float,
         avg_az: float,
-    ) -> None:
+    ):
         self._last_values = (thumb, index, middle)
         self._latest_values.update(
             {
@@ -336,12 +315,12 @@ class MainWindow(QMainWindow):
         self.ay_label.setText(f"{avg_ay:.3f}")
         self.az_label.setText(f"{avg_az:.3f}")
 
-    def _start_calibration(self) -> None:
+    def _start_calibration(self):
         self._step_index = 0
         self.capture_button.setEnabled(True)
         self._advance_step()
 
-    def _capture_step(self) -> None:
+    def _capture_step(self):
         if self._step_index >= len(CALIBRATION_STEPS):
             return
         step = CALIBRATION_STEPS[self._step_index]
@@ -358,7 +337,7 @@ class MainWindow(QMainWindow):
         else:
             self._advance_step()
 
-    def _advance_step(self) -> None:
+    def _advance_step(self):
         step = CALIBRATION_STEPS[self._step_index]
         self.step_label.setText(
             f"Step {self._step_index + 1}/{len(CALIBRATION_STEPS)}: {step.prompt}"
@@ -366,33 +345,33 @@ class MainWindow(QMainWindow):
         self._set_status("Waiting for user input...")
         self._speak(step.prompt)
 
-    def _speak(self, text: str) -> None:
+    def _speak(self, text: str):
         self._set_status("Generating voice instruction...")
         self.tts_request.emit(text)
 
     @Slot(str)
-    def _play_audio(self, file_path: str) -> None:
+    def _play_audio(self, file_path: str):
         self.player.setSource(QUrl.fromLocalFile(file_path))
         self.player.play()
         self._set_status("Playing instruction...")
 
-    def _finish_calibration(self) -> None:
+    def _finish_calibration(self):
         self.step_label.setText("Calibration complete")
         self._set_status("Calibration complete. Saving results...")
         self._save_calibration()
         self._speak("Calibration complete.")
 
-    def _save_calibration(self) -> None:
+    def _save_calibration(self):
         file_path = os.path.join(os.getcwd(), "calibration.json")
         with open(file_path, "w", encoding="utf-8") as handle:
             json.dump(self._calibration, handle, indent=2)
         self._set_status(f"Saved calibration to {file_path}")
 
     @Slot(str)
-    def _set_status(self, message: str) -> None:
+    def _set_status(self, message: str):
         self.status_label.setText(f"Status: {message}")
 
-    def closeEvent(self, event) -> None:  # type: ignore[override]
+    def closeEvent(self, event):  # type: ignore[override]
         if hasattr(self, "serial_worker"):
             self.serial_worker.stop()
         if hasattr(self, "serial_thread"):
@@ -404,7 +383,7 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
 
-def main() -> None:
+def main():
     app = QApplication(sys.argv)
     window = MainWindow()
     window.resize(520, 360)
