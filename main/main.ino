@@ -1,6 +1,9 @@
 #include <Wire.h>
-// #include <SoftwareSerial.h>
+#include <SoftwareSerial.h>
 #include <MPU6050_tockn.h>
+
+const uint8_t USB_BAUD_RATE = 115200;
+const uint8_t BT_BAUD_RATE = 9600;
 
 // Pins
 const uint8_t PIN_FLEX_THUMB = A0;
@@ -103,8 +106,14 @@ void setup()
     pinMode(PIN_LED, OUTPUT);
     digitalWrite(PIN_LED, LOW);
 
-    Serial.begin(115200);
-    // btSerial.begin(9600);
+    Serial.begin(USB_BAUD_RATE);
+    while (!Serial)
+        ;
+    Serial.println("---AeroMix---");
+    // btSerial.begin(BT_BAUD_RATE);
+    // while (!btSerial)
+    //     ;
+    // btSerial.println("---AeroMix---");
 
     calibrateFlexSensors();
 
@@ -152,4 +161,22 @@ void loop()
     Serial.print(avgAy, 3);
     Serial.print(',');
     Serial.println(avgAz, 3);
+
+    // btSerial.print(rawThumb);
+    // btSerial.print(',');
+    // btSerial.print(rawIndex);
+    // btSerial.print(',');
+    // btSerial.print(rawMiddle);
+    // btSerial.print(',');
+    // btSerial.print(emaRoll, 2);
+    // btSerial.print(',');
+    // btSerial.print(emaPitch, 2);
+    // btSerial.print(',');
+    // btSerial.print(yaw, 2);
+    // btSerial.print(',');
+    // btSerial.print(avgAx, 3);
+    // btSerial.print(',');
+    // btSerial.print(avgAy, 3);
+    // btSerial.print(',');
+    // btSerial.println(avgAz, 3);
 }

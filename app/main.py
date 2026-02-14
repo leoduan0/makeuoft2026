@@ -36,14 +36,28 @@ SERIAL_BAUD = 115200
 MIDI_DEFAULT_PORT = "AeroMix"
 MIDI_CHANNEL = 0
 MIDI_SEND_INTERVAL = 0.03
-MIDI_CC_MAP = {
-    "thumb": 20,
-    "index": 21,
-    "middle": 22,
-    "roll": 23,
-    "pitch": 24,
-    "yaw": 25,
+# DJ effect CC mappings (disabled for now)
+# MIDI_CC_MAP = {
+#     "thumb": 20,
+#     "index": 21,
+#     "middle": 22,
+#     "roll": 23,
+#     "pitch": 24,
+#     "yaw": 25,
+# }
+
+# Debug note mappings
+MIDI_NOTE_MAP = {
+    "thumb": 36,  # C1 kick
+    "index": 42,  # F#1 closed hat
+    "middle": 38,  # D1 snare
+    "left": 62,  # D4
+    "right": 60,  # C4
+    "up": 64,  # E4
 }
+NOTE_ON_VELOCITY = 110
+FINGER_TRIGGER_THRESHOLD = 0.65
+AXIS_TRIGGER_THRESHOLD = 0.6
 
 
 def _clamp(value: float, min_value: float, max_value: float) -> float:
@@ -79,6 +93,19 @@ class MidiOutput:
             "control_change",
             control=control,
             value=_clamp(value, 0, 127),
+            channel=channel,
+        )
+        self._out.send(message)
+
+    def send_note(
+        self, note: int, velocity: int, is_on: bool, channel: int = MIDI_CHANNEL
+    ):
+        if not self._out:
+            return
+        message = mido.Message(
+            "note_on" if is_on else "note_off",
+            note=note,
+            velocity=_clamp(velocity, 0, 127),
             channel=channel,
         )
         self._out.send(message)
@@ -226,6 +253,7 @@ class MainWindow(QMainWindow):
         self._midi_out = None
         self._last_midi_send = 0.0
         self._last_midi_values = {}
+        self._note_states: Dict[str, bool] = {}
 
         self._build_ui()
         self._setup_audio()
@@ -438,7 +466,7 @@ class MainWindow(QMainWindow):
         self.ax_label.setText(f"{avg_ax:.3f}")
         self.ay_label.setText(f"{avg_ay:.3f}")
         self.az_label.setText(f"{avg_az:.3f}")
-        self._send_midi(thumb, index, middle, ema_roll, ema_pitch, yaw)
+        self._send_midi(thumb, index, middle, avg_ax, avg_ay, avg_az)
 
     def _normalize_finger(self, finger: str, value: int) -> int:
         calib = self._calibration.get(finger, {"min": 0, "max": 1023})
@@ -449,20 +477,14 @@ class MainWindow(QMainWindow):
             max_val = 1023
         return int(round(_clamp((value - min_val) / (max_val - min_val), 0, 1) * 127))
 
-    def _normalize_axis(self, value: float, min_val: float, max_val: float) -> int:
-        if max_val <= min_val:
-            return 0
-        normalized = (value - min_val) / (max_val - min_val)
-        return int(round(_clamp(normalized, 0, 1) * 127))
-
     def _send_midi(
         self,
         thumb: int,
         index: int,
         middle: int,
-        ema_roll: float,
-        ema_pitch: float,
-        yaw: float,
+        avg_ax: float,
+        avg_ay: float,
+        avg_az: float,
     ):
         if not self._midi_out:
             return
@@ -471,26 +493,35 @@ class MainWindow(QMainWindow):
             return
         self._last_midi_send = now
 
-        values = {
-            "thumb": self._normalize_finger("thumb", thumb),
-            "index": self._normalize_finger("index", index),
-            "middle": self._normalize_finger("middle", middle),
-            "roll": self._normalize_axis(ema_roll, -180.0, 180.0),
-            "pitch": self._normalize_axis(ema_pitch, -90.0, 90.0),
-            "yaw": self._normalize_axis(yaw, -180.0, 180.0),
-        }
+        thumb_norm = self._normalize_finger("thumb", thumb) / 127
+        index_norm = self._normalize_finger("index", index) / 127
+        middle_norm = self._normalize_finger("middle", middle) / 127
 
-        for key, midi_value in values.items():
-            last_value = self._last_midi_values.get(key)
-            if last_value == midi_value:
-                continue
-            self._last_midi_values[key] = midi_value
-            self._midi_out.send_cc(MIDI_CC_MAP[key], midi_value)
+        self._set_note_state("thumb", thumb_norm >= FINGER_TRIGGER_THRESHOLD)
+        self._set_note_state("index", index_norm >= FINGER_TRIGGER_THRESHOLD)
+        self._set_note_state("middle", middle_norm >= FINGER_TRIGGER_THRESHOLD)
+
+        self._set_note_state("left", avg_ax <= -AXIS_TRIGGER_THRESHOLD)
+        self._set_note_state("right", avg_ax >= AXIS_TRIGGER_THRESHOLD)
+        self._set_note_state("up", avg_ay >= AXIS_TRIGGER_THRESHOLD)
 
     def _start_calibration(self):
         self._step_index = 0
         self.capture_button.setEnabled(True)
         self._advance_step()
+
+    def _set_note_state(self, key: str, is_on: bool):
+        if not self._midi_out:
+            return
+        previous = self._note_states.get(key, False)
+        if previous == is_on:
+            return
+        self._note_states[key] = is_on
+        self._midi_out.send_note(
+            MIDI_NOTE_MAP[key],
+            NOTE_ON_VELOCITY,
+            is_on,
+        )
 
     def _capture_step(self):
         if self._step_index >= len(CALIBRATION_STEPS):
