@@ -1,5 +1,7 @@
 elevenlabs
+mido
 PySide6
 pyserial
 python-dotenv
+python-rtmidi
 requests

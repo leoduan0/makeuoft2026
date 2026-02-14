@@ -2,6 +2,7 @@ import json
 import os
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from typing import Dict, Optional
 
@@ -15,6 +16,7 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
+    QComboBox,
     QLabel,
     QMainWindow,
     QPushButton,
@@ -24,12 +26,70 @@ from PySide6.QtWidgets import (
 )
 from elevenlabs.client import ElevenLabs
 from elevenlabs.play import play
+import mido
 
 load_dotenv()
 
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 ELEVENLABS_VOICE_ID = "pNInz6obpgDQGcFmaJgB"  # adam
 SERIAL_BAUD = 115200
+MIDI_DEFAULT_PORT = "AeroMix"
+MIDI_CHANNEL = 0
+MIDI_SEND_INTERVAL = 0.03
+MIDI_CC_MAP = {
+    "thumb": 20,
+    "index": 21,
+    "middle": 22,
+    "roll": 23,
+    "pitch": 24,
+    "yaw": 25,
+}
+
+
+def _clamp(value: float, min_value: float, max_value: float) -> float:
+    return max(min_value, min(value, max_value))
+
+
+class MidiOutput:
+    def __init__(self, port_name: Optional[str] = None):
+        self._port_name = port_name
+        self._out: Optional[mido.ports.BaseOutput] = None
+
+    def open(self) -> str:
+        if self._port_name:
+            self._out = mido.open_output(self._port_name)
+            return self._port_name
+
+        try:
+            self._out = mido.open_output(MIDI_DEFAULT_PORT, virtual=True)
+            return MIDI_DEFAULT_PORT
+        except Exception:
+            pass
+
+        ports = mido.get_output_names()
+        if not ports:
+            raise RuntimeError("No MIDI output ports available")
+        self._out = mido.open_output(ports[0])
+        return ports[0]
+
+    def send_cc(self, control: int, value: int, channel: int = MIDI_CHANNEL):
+        if not self._out:
+            return
+        message = mido.Message(
+            "control_change",
+            control=control,
+            value=_clamp(value, 0, 127),
+            channel=channel,
+        )
+        self._out.send(message)
+
+    def close(self):
+        if self._out:
+            try:
+                self._out.close()
+            except Exception:
+                pass
+            self._out = None
 
 
 @dataclass
@@ -144,7 +204,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Flex Sensor Calibration")
+        self.setWindowTitle("AeroMix")
         self._last_values = (0, 0, 0)
         self._latest_values = {
             "thumb": 0,
@@ -163,11 +223,16 @@ class MainWindow(QMainWindow):
             "middle": {"min": 0, "max": 0},
         }
         self._step_index = 0
+        self._midi_out = None
+        self._last_midi_send = 0.0
+        self._last_midi_values = {}
 
         self._build_ui()
         self._setup_audio()
         self._setup_tts_worker()
-        self._connect_serial()
+        self._setup_midi()
+        self._refresh_serial_ports(select_best=True)
+        self._connect_serial_from_selection()
 
     def _build_ui(self):
         root = QWidget()
@@ -176,6 +241,16 @@ class MainWindow(QMainWindow):
         self.step_label = QLabel("Calibration step: Not started")
         self.step_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.step_label)
+
+        device_group = QGroupBox("Input Device")
+        device_layout = QHBoxLayout(device_group)
+        self.port_combo = QComboBox()
+        self.refresh_button = QPushButton("Refresh")
+        self.connect_button = QPushButton("Connect")
+        device_layout.addWidget(self.port_combo)
+        device_layout.addWidget(self.refresh_button)
+        device_layout.addWidget(self.connect_button)
+        layout.addWidget(device_group)
 
         sensor_group = QGroupBox("Live Sensor Readings")
         sensor_layout = QGridLayout(sensor_group)
@@ -234,6 +309,8 @@ class MainWindow(QMainWindow):
 
         self.start_button.clicked.connect(self._start_calibration)
         self.capture_button.clicked.connect(self._capture_step)
+        self.refresh_button.clicked.connect(self._refresh_serial_ports)
+        self.connect_button.clicked.connect(self._connect_serial_from_selection)
 
     def _setup_audio(self):
         self.player = QMediaPlayer(self)
@@ -251,11 +328,57 @@ class MainWindow(QMainWindow):
             self.tts_worker.speak, Qt.ConnectionType.QueuedConnection
         )
 
-    def _connect_serial(self):
-        port = self._detect_port()
-        if not port:
-            self._set_status("No serial port found. Connect Arduino and restart.")
+    def _setup_midi(self):
+        port_name = os.getenv("MIDI_PORT")
+        self._midi_out = MidiOutput(port_name=port_name)
+        try:
+            opened_name = self._midi_out.open()
+            self._set_status(f"MIDI ready: {opened_name}")
+        except Exception as exc:
+            self._midi_out = None
+            self._set_status(f"MIDI unavailable: {exc}")
+
+    def _refresh_serial_ports(self, select_best: bool = False):
+        ports = list(list_ports.comports())
+        self.port_combo.blockSignals(True)
+        self.port_combo.clear()
+
+        if not ports:
+            self.port_combo.addItem("No ports found", None)
+            self.port_combo.setEnabled(False)
+            self.connect_button.setEnabled(False)
+            self._set_status("No serial ports found.")
+            self.port_combo.blockSignals(False)
             return
+
+        self.port_combo.setEnabled(True)
+        self.connect_button.setEnabled(True)
+        for port in ports:
+            label = f"{port.device} — {port.description}"
+            self.port_combo.addItem(label, port.device)
+
+        if select_best:
+            best = self._detect_port(ports)
+            if best:
+                index = self.port_combo.findData(best)
+                if index != -1:
+                    self.port_combo.setCurrentIndex(index)
+        self.port_combo.blockSignals(False)
+
+    def _connect_serial_from_selection(self):
+        port = self.port_combo.currentData()
+        if not port:
+            self._set_status("No serial port selected.")
+            return
+        self._connect_serial(port)
+
+    def _connect_serial(self, port: str):
+        if hasattr(self, "serial_worker"):
+            self.serial_worker.stop()
+        if hasattr(self, "serial_thread"):
+            self.serial_thread.quit()
+            self.serial_thread.wait(1000)
+
         self.serial_thread = QThread(self)
         self.serial_worker = SerialReader(port, SERIAL_BAUD)
         self.serial_worker.moveToThread(self.serial_thread)
@@ -264,8 +387,9 @@ class MainWindow(QMainWindow):
         self.serial_worker.status.connect(self._set_status)
         self.serial_thread.start()
 
-    def _detect_port(self):
-        ports = list(list_ports.comports())
+    def _detect_port(self, ports=None):
+        if ports is None:
+            ports = list(list_ports.comports())
         if not ports:
             return None
         for port in ports:
@@ -314,6 +438,54 @@ class MainWindow(QMainWindow):
         self.ax_label.setText(f"{avg_ax:.3f}")
         self.ay_label.setText(f"{avg_ay:.3f}")
         self.az_label.setText(f"{avg_az:.3f}")
+        self._send_midi(thumb, index, middle, ema_roll, ema_pitch, yaw)
+
+    def _normalize_finger(self, finger: str, value: int) -> int:
+        calib = self._calibration.get(finger, {"min": 0, "max": 1023})
+        min_val = calib.get("min", 0)
+        max_val = calib.get("max", 1023)
+        if max_val <= min_val:
+            min_val = 0
+            max_val = 1023
+        return int(round(_clamp((value - min_val) / (max_val - min_val), 0, 1) * 127))
+
+    def _normalize_axis(self, value: float, min_val: float, max_val: float) -> int:
+        if max_val <= min_val:
+            return 0
+        normalized = (value - min_val) / (max_val - min_val)
+        return int(round(_clamp(normalized, 0, 1) * 127))
+
+    def _send_midi(
+        self,
+        thumb: int,
+        index: int,
+        middle: int,
+        ema_roll: float,
+        ema_pitch: float,
+        yaw: float,
+    ):
+        if not self._midi_out:
+            return
+        now = time.monotonic()
+        if now - self._last_midi_send < MIDI_SEND_INTERVAL:
+            return
+        self._last_midi_send = now
+
+        values = {
+            "thumb": self._normalize_finger("thumb", thumb),
+            "index": self._normalize_finger("index", index),
+            "middle": self._normalize_finger("middle", middle),
+            "roll": self._normalize_axis(ema_roll, -180.0, 180.0),
+            "pitch": self._normalize_axis(ema_pitch, -90.0, 90.0),
+            "yaw": self._normalize_axis(yaw, -180.0, 180.0),
+        }
+
+        for key, midi_value in values.items():
+            last_value = self._last_midi_values.get(key)
+            if last_value == midi_value:
+                continue
+            self._last_midi_values[key] = midi_value
+            self._midi_out.send_cc(MIDI_CC_MAP[key], midi_value)
 
     def _start_calibration(self):
         self._step_index = 0
@@ -380,6 +552,8 @@ class MainWindow(QMainWindow):
         if hasattr(self, "tts_thread"):
             self.tts_thread.quit()
             self.tts_thread.wait(1000)
+        if self._midi_out:
+            self._midi_out.close()
         super().closeEvent(event)
 
 
