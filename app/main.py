@@ -3,8 +3,9 @@ import os
 import sys
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Deque, Dict, Optional
 
 from dotenv import load_dotenv
 import serial
@@ -37,6 +38,20 @@ MIN_CALIBRATION_SAMPLES = 10
 MIDI_DEFAULT_PORT = "AeroMix"
 MIDI_CHANNEL = 0
 MIDI_SEND_INTERVAL = 0.03
+MIDI_VOLUME_CC = 7
+MIDI_VOLUME_NEUTRAL_CC = 32
+MIDI_VOLUME_MIN_CC = 0
+MIDI_REVERB_CC = 12
+THUMB_MEDIAN_WINDOW = 5
+THUMB_EMA_ALPHA = 0.3
+THUMB_CC_DEADBAND = 1
+THUMB_CC_SLEW_PER_SEC = 140.0
+INDEX_EFFECT_ACTIVATION_CURL = 0.08
+INDEX_EFFECT_MEDIAN_WINDOW = 5
+INDEX_EFFECT_EMA_ALPHA = 0.3
+INDEX_EFFECT_CC_DEADBAND = 1
+INDEX_EFFECT_CC_SLEW_PER_SEC = 160.0
+DEBUG_NOTES_ENABLED = False
 CALIBRATION_FILENAME = "calibration.json"
 # DJ effect CC mappings (disabled for now)
 # MIDI_CC_MAP = {
@@ -47,8 +62,6 @@ CALIBRATION_FILENAME = "calibration.json"
 
 # Debug note mappings
 MIDI_NOTE_MAP = {
-    "thumb": 36,  # C1 kick
-    "index": 42,  # F#1 closed hat
     "middle": 38,  # D1 snare
 }
 NOTE_ON_VELOCITY = 110
@@ -122,7 +135,7 @@ class CalibrationStep:
 
 CALIBRATION_STEPS = [
     CalibrationStep("thumb", "bent", "Now bend your thumb fully."),
-    CalibrationStep("thumb", "relaxed", "Please relax your thumb."),
+    CalibrationStep("thumb", "relaxed", "Now straighten your thumb fully."),
     CalibrationStep("index", "bent", "Now bend your index finger fully."),
     CalibrationStep("index", "relaxed", "Please relax your index finger."),
     CalibrationStep("middle", "bent", "Now bend your middle finger fully."),
@@ -242,6 +255,14 @@ class MainWindow(QMainWindow):
         self._step_index = 0
         self._midi_out = None
         self._last_midi_send = 0.0
+        self._last_thumb_cc: Optional[int] = None
+        self._thumb_cc_ema: Optional[float] = None
+        self._thumb_cc_slew: Optional[float] = None
+        self._thumb_cc_history: Deque[int] = deque(maxlen=THUMB_MEDIAN_WINDOW)
+        self._last_echo_cc: Optional[int] = None
+        self._echo_cc_ema: Optional[float] = None
+        self._echo_cc_slew: Optional[float] = None
+        self._echo_cc_history: Deque[int] = deque(maxlen=INDEX_EFFECT_MEDIAN_WINDOW)
         self._note_states: Dict[str, bool] = {}
         self._recent_samples: Dict[str, list[int]] = {
             "thumb": [],
@@ -404,10 +425,20 @@ class MainWindow(QMainWindow):
         self._midi_out = MidiOutput(port_name=port_name)
         try:
             opened_name = self._midi_out.open()
+            self._send_midi_panic()
             self._set_status(f"MIDI ready: {opened_name}")
         except Exception as exc:
             self._midi_out = None
             self._set_status(f"MIDI unavailable: {exc}")
+
+    def _send_midi_panic(self):
+        if not self._midi_out:
+            return
+        # Stop any lingering notes from previous mappings/runs.
+        self._midi_out.send_cc(123, 0)  # all notes off
+        self._midi_out.send_cc(120, 0)  # all sound off
+        for note in (36, 42):
+            self._midi_out.send_note(note, 0, False)
 
     def _refresh_serial_ports(self, select_best: bool = False):
         ports = list(list_ports.comports())
@@ -549,13 +580,128 @@ class MainWindow(QMainWindow):
         if not self._is_calibrated:
             return
         now = time.monotonic()
-        if now - self._last_midi_send < MIDI_SEND_INTERVAL:
+        elapsed = now - self._last_midi_send
+        if elapsed < MIDI_SEND_INTERVAL:
             return
         self._last_midi_send = now
 
-        self._set_note_state("thumb", self._is_finger_bent("thumb", thumb))
-        self._set_note_state("index", self._is_finger_bent("index", index))
-        self._set_note_state("middle", self._is_finger_bent("middle", middle))
+        thumb_cc = self._thumb_volume_cc(thumb, elapsed)
+        if thumb_cc is not None and thumb_cc != self._last_thumb_cc:
+            self._midi_out.send_cc(MIDI_VOLUME_CC, thumb_cc)
+            self._last_thumb_cc = thumb_cc
+
+        echo_cc = self._index_reverb_cc(index, elapsed)
+        if echo_cc is not None and echo_cc != self._last_echo_cc:
+            self._midi_out.send_cc(MIDI_REVERB_CC, echo_cc)
+            self._last_echo_cc = echo_cc
+
+        if DEBUG_NOTES_ENABLED:
+            self._set_note_state("middle", self._is_finger_bent("middle", middle))
+
+    def _finger_curl_amount(self, finger: str, finger_value: int) -> Optional[float]:
+        calib = self._calibration.get(finger)
+        if not calib:
+            return None
+
+        straight = int(calib.get("relaxed", 0))
+        curled = int(calib.get("bent", 0))
+        span = curled - straight
+        if span == 0:
+            return None
+
+        curl_amount = (finger_value - straight) / span
+        return _clamp(curl_amount, 0.0, 1.0)
+
+    def _thumb_volume_cc(self, thumb_value: int, elapsed: float) -> Optional[int]:
+        curl_amount = self._finger_curl_amount("thumb", thumb_value)
+        if curl_amount is None:
+            return None
+
+        raw_cc = int(
+            round(
+                MIDI_VOLUME_NEUTRAL_CC
+                - curl_amount * (MIDI_VOLUME_NEUTRAL_CC - MIDI_VOLUME_MIN_CC)
+            )
+        )
+
+        self._thumb_cc_history.append(raw_cc)
+        median_cc = sorted(self._thumb_cc_history)[len(self._thumb_cc_history) // 2]
+
+        if self._thumb_cc_ema is None:
+            self._thumb_cc_ema = float(median_cc)
+        else:
+            self._thumb_cc_ema = (
+                THUMB_EMA_ALPHA * float(median_cc)
+                + (1.0 - THUMB_EMA_ALPHA) * self._thumb_cc_ema
+            )
+
+        target = self._thumb_cc_ema
+        if self._thumb_cc_slew is None:
+            self._thumb_cc_slew = target
+        else:
+            max_delta = THUMB_CC_SLEW_PER_SEC * max(0.0, min(elapsed, 0.2))
+            delta = target - self._thumb_cc_slew
+            if delta > max_delta:
+                delta = max_delta
+            elif delta < -max_delta:
+                delta = -max_delta
+            self._thumb_cc_slew += delta
+
+        cc_value = int(round(_clamp(self._thumb_cc_slew, 0.0, 127.0)))
+
+        if (
+            self._last_thumb_cc is not None
+            and abs(cc_value - self._last_thumb_cc) < THUMB_CC_DEADBAND
+        ):
+            return self._last_thumb_cc
+
+        return cc_value
+
+    def _index_reverb_cc(self, index_value: int, elapsed: float) -> Optional[int]:
+        index_curl = self._finger_curl_amount("index", index_value)
+        if index_curl is None:
+            return None
+
+        if index_curl <= INDEX_EFFECT_ACTIVATION_CURL:
+            index_strength = 0.0
+        else:
+            index_strength = (index_curl - INDEX_EFFECT_ACTIVATION_CURL) / (
+                1.0 - INDEX_EFFECT_ACTIVATION_CURL
+            )
+
+        raw_cc = int(round(_clamp(index_strength, 0.0, 1.0) * 127.0))
+
+        self._echo_cc_history.append(raw_cc)
+        median_cc = sorted(self._echo_cc_history)[len(self._echo_cc_history) // 2]
+
+        if self._echo_cc_ema is None:
+            self._echo_cc_ema = float(median_cc)
+        else:
+            self._echo_cc_ema = (
+                INDEX_EFFECT_EMA_ALPHA * float(median_cc)
+                + (1.0 - INDEX_EFFECT_EMA_ALPHA) * self._echo_cc_ema
+            )
+
+        target = self._echo_cc_ema
+        if self._echo_cc_slew is None:
+            self._echo_cc_slew = target
+        else:
+            max_delta = INDEX_EFFECT_CC_SLEW_PER_SEC * max(0.0, min(elapsed, 0.2))
+            delta = target - self._echo_cc_slew
+            if delta > max_delta:
+                delta = max_delta
+            elif delta < -max_delta:
+                delta = -max_delta
+            self._echo_cc_slew += delta
+
+        cc_value = int(round(_clamp(self._echo_cc_slew, 0.0, 127.0)))
+        if (
+            self._last_echo_cc is not None
+            and abs(cc_value - self._last_echo_cc) < INDEX_EFFECT_CC_DEADBAND
+        ):
+            return self._last_echo_cc
+
+        return cc_value
 
     def _start_calibration(self):
         self._is_calibrated = False
@@ -564,13 +710,21 @@ class MainWindow(QMainWindow):
             "index": self._default_finger_calibration(),
             "middle": self._default_finger_calibration(),
         }
+        self._last_thumb_cc = None
+        self._thumb_cc_ema = None
+        self._thumb_cc_slew = None
+        self._thumb_cc_history.clear()
+        self._last_echo_cc = None
+        self._echo_cc_ema = None
+        self._echo_cc_slew = None
+        self._echo_cc_history.clear()
         self._note_states = {}
         self._step_index = 0
         self.capture_button.setEnabled(True)
         self._advance_step()
 
     def _set_note_state(self, key: str, is_on: bool):
-        if not self._midi_out:
+        if not self._midi_out or not DEBUG_NOTES_ENABLED:
             return
         previous = self._note_states.get(key, False)
         if previous == is_on:
