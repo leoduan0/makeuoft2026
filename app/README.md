@@ -10,6 +10,18 @@ Minimal Qt prototype that reads three flex sensors over serial and guides calibr
 pip install -r requirements.txt
 ```
 
+# Flex Sensor Calibration (Qt + Arduino + ElevenLabs)
+
+Qt app that reads three flex sensors over serial, calibrates bend/relaxed poses, and triggers drum notes over MIDI.
+
+## Setup
+
+1. Install dependencies
+
+```
+pip install -r requirements.txt
+```
+
 2. Set environment variables
 
 ```
@@ -24,6 +36,7 @@ export ELEVENLABS_VOICE_ID=21m00Tcm4TlvDq8ikWAM
 
 ```
 python main.py
+```
 
 ## Ableton MIDI setup (macOS)
 
@@ -31,7 +44,7 @@ Option A: Use the virtual MIDI port created by the app.
 
 1. Open Ableton Live → Settings/Preferences → Link/Tempo/MIDI.
 2. In the MIDI Ports list, enable Track/Remote for "AeroMix".
-3. Enter MIDI Map Mode (Cmd+M) and map CCs to parameters.
+3. Put a Drum Rack on a MIDI track and monitor incoming notes.
 
 Option B: Use the built-in IAC Bus.
 
@@ -39,33 +52,31 @@ Option B: Use the built-in IAC Bus.
 2. Double-click IAC Driver and enable it.
 3. Restart the app and set: export MIDI_PORT="IAC Driver Bus 1".
 4. Enable Track/Remote for that bus in Ableton.
-```
 
 ## Arduino serial format
 
 Send one line per sample:
 
 ```
-thumb,index,middle,emaRoll,emaPitch,yaw,avgAx,avgAy,avgAz
+thumb,index,middle
 ```
 
 Example:
 
 ```
-512,478,501,-2.3,1.1,180.0,0.01,-0.02,0.98
+512,478,501
 ```
 
 Baud rate: 115200
 
-## MIDI mappings (default CCs)
+## MIDI note mappings
 
-- Thumb → CC 20
-- Index → CC 21
-- Middle → CC 22
-- emaRoll → CC 23
-- emaPitch → CC 24
-- Yaw → CC 25
+- Thumb bend → Note 36 (Kick)
+- Index bend → Note 42 (Hi-hat)
+- Middle bend → Note 38 (Snare)
 
-## Output
+## Calibration persistence
 
-Calibration results are saved to calibration.json in the working directory.
+- Calibration is stored in app/calibration.json.
+- If the file exists at startup, calibration is loaded and skipped.
+- Click Recalibrate to run calibration again and overwrite the file.

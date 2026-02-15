@@ -1,38 +1,12 @@
-#include <Wire.h>
-#include <SoftwareSerial.h>
-#include <MPU6050_tockn.h>
-
-const uint8_t USB_BAUD_RATE = 115200;
-const uint8_t BT_BAUD_RATE = 9600;
-
 // Pins
 const uint8_t PIN_FLEX_THUMB = A0;
 const uint8_t PIN_FLEX_INDEX = A1;
 const uint8_t PIN_FLEX_MIDDLE = A2;
-const uint8_t PIN_BT_RX = 2; // HC-05 TXD -> Arduino D2 (RX)
-const uint8_t PIN_BT_TX = 3; // HC-05 RXD -> Arduino D3 (TX)
-const uint8_t PIN_LED = 13;
-
-// MPU smoothing
-const float EMA_ALPHA = 0.2f;
-const uint8_t ACC_AVG_SAMPLES = 10;
-
-// SoftwareSerial btSerial(PIN_BT_RX, PIN_BT_TX);
-MPU6050 mpu(Wire);
+const uint8_t LED_PIN = 13;
 
 // Calibration data
 int flexMin[3] = {1023, 1023, 1023};
 int flexMax[3] = {0, 0, 0};
-
-// MPU data
-float emaRoll = 0.0f;
-float emaPitch = 0.0f;
-
-float accXBuf[ACC_AVG_SAMPLES];
-float accYBuf[ACC_AVG_SAMPLES];
-float accZBuf[ACC_AVG_SAMPLES];
-uint8_t accIndex = 0;
-bool accFilled = false;
 
 void calibrateFlexSensors()
 {
@@ -63,62 +37,15 @@ void calibrateFlexSensors()
     }
 }
 
-bool initMPU()
-{
-    mpu.begin();
-    delay(200);
-    mpu.calcGyroOffsets(true);
-    return true;
-}
-
-void updateAccAverages(float ax, float ay, float az)
-{
-    accXBuf[accIndex] = ax;
-    accYBuf[accIndex] = ay;
-    accZBuf[accIndex] = az;
-    accIndex = (accIndex + 1) % ACC_AVG_SAMPLES;
-    if (accIndex == 0)
-        accFilled = true;
-}
-
-void getAccAverages(float &ax, float &ay, float &az)
-{
-    uint8_t count = accFilled ? ACC_AVG_SAMPLES : accIndex;
-    if (count == 0)
-    {
-        ax = ay = az = 0;
-        return;
-    }
-    float sumX = 0, sumY = 0, sumZ = 0;
-    for (uint8_t i = 0; i < count; i++)
-    {
-        sumX += accXBuf[i];
-        sumY += accYBuf[i];
-        sumZ += accZBuf[i];
-    }
-    ax = sumX / count;
-    ay = sumY / count;
-    az = sumZ / count;
-}
-
 void setup()
 {
-    pinMode(PIN_LED, OUTPUT);
-    digitalWrite(PIN_LED, LOW);
+    pinMode(LED_PIN, OUTPUT);
+    digitalWrite(LED_PIN, LOW);
 
-    Serial.begin(USB_BAUD_RATE);
-    while (!Serial)
-        ;
+    Serial.begin(115200);
     Serial.println("---AeroMix---");
-    // btSerial.begin(BT_BAUD_RATE);
-    // while (!btSerial)
-    //     ;
-    // btSerial.println("---AeroMix---");
 
     calibrateFlexSensors();
-
-    Wire.begin();
-    initMPU();
 }
 
 void loop()
@@ -127,56 +54,9 @@ void loop()
     int rawIndex = analogRead(PIN_FLEX_INDEX);
     int rawMiddle = analogRead(PIN_FLEX_MIDDLE);
 
-    mpu.update();
-
-    float ax = mpu.getAccX();
-    float ay = mpu.getAccY();
-    float az = mpu.getAccZ();
-    updateAccAverages(ax, ay, az);
-
-    float avgAx, avgAy, avgAz;
-    getAccAverages(avgAx, avgAy, avgAz);
-
-    float roll = mpu.getAngleX();
-    float pitch = mpu.getAngleY();
-    float yaw = mpu.getAngleZ();
-
-    emaRoll = EMA_ALPHA * roll + (1.0f - EMA_ALPHA) * emaRoll;
-    emaPitch = EMA_ALPHA * pitch + (1.0f - EMA_ALPHA) * emaPitch;
-
     Serial.print(rawThumb);
     Serial.print(',');
     Serial.print(rawIndex);
     Serial.print(',');
-    Serial.print(rawMiddle);
-    Serial.print(',');
-    Serial.print(emaRoll, 2);
-    Serial.print(',');
-    Serial.print(emaPitch, 2);
-    Serial.print(',');
-    Serial.print(yaw, 2);
-    Serial.print(',');
-    Serial.print(avgAx, 3);
-    Serial.print(',');
-    Serial.print(avgAy, 3);
-    Serial.print(',');
-    Serial.println(avgAz, 3);
-
-    // btSerial.print(rawThumb);
-    // btSerial.print(',');
-    // btSerial.print(rawIndex);
-    // btSerial.print(',');
-    // btSerial.print(rawMiddle);
-    // btSerial.print(',');
-    // btSerial.print(emaRoll, 2);
-    // btSerial.print(',');
-    // btSerial.print(emaPitch, 2);
-    // btSerial.print(',');
-    // btSerial.print(yaw, 2);
-    // btSerial.print(',');
-    // btSerial.print(avgAx, 3);
-    // btSerial.print(',');
-    // btSerial.print(avgAy, 3);
-    // btSerial.print(',');
-    // btSerial.println(avgAz, 3);
+    Serial.println(rawMiddle);
 }

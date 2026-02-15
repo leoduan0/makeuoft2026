@@ -33,17 +33,16 @@ load_dotenv()
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 ELEVENLABS_VOICE_ID = "pNInz6obpgDQGcFmaJgB"  # adam
 SERIAL_BAUD = 115200
+MIN_CALIBRATION_SAMPLES = 10
 MIDI_DEFAULT_PORT = "AeroMix"
 MIDI_CHANNEL = 0
 MIDI_SEND_INTERVAL = 0.03
+CALIBRATION_FILENAME = "calibration.json"
 # DJ effect CC mappings (disabled for now)
 # MIDI_CC_MAP = {
 #     "thumb": 20,
 #     "index": 21,
 #     "middle": 22,
-#     "roll": 23,
-#     "pitch": 24,
-#     "yaw": 25,
 # }
 
 # Debug note mappings
@@ -51,13 +50,8 @@ MIDI_NOTE_MAP = {
     "thumb": 36,  # C1 kick
     "index": 42,  # F#1 closed hat
     "middle": 38,  # D1 snare
-    "left": 62,  # D4
-    "right": 60,  # C4
-    "up": 64,  # E4
 }
 NOTE_ON_VELOCITY = 110
-FINGER_TRIGGER_THRESHOLD = 0.65
-AXIS_TRIGGER_THRESHOLD = 0.6
 
 
 def _clamp(value: float, min_value: float, max_value: float) -> float:
@@ -71,19 +65,19 @@ class MidiOutput:
 
     def open(self) -> str:
         if self._port_name:
-            self._out = mido.open_output(self._port_name)
+            self._out = mido.open_output(self._port_name)  # type: ignore[attr-defined]
             return self._port_name
 
         try:
-            self._out = mido.open_output(MIDI_DEFAULT_PORT, virtual=True)
+            self._out = mido.open_output(MIDI_DEFAULT_PORT, virtual=True)  # type: ignore[attr-defined]
             return MIDI_DEFAULT_PORT
         except Exception:
             pass
 
-        ports = mido.get_output_names()
+        ports = mido.get_output_names()  # type: ignore[attr-defined]
         if not ports:
             raise RuntimeError("No MIDI output ports available")
-        self._out = mido.open_output(ports[0])
+        self._out = mido.open_output(ports[0])  # type: ignore[attr-defined]
         return ports[0]
 
     def send_cc(self, control: int, value: int, channel: int = MIDI_CHANNEL):
@@ -122,22 +116,22 @@ class MidiOutput:
 @dataclass
 class CalibrationStep:
     finger: str
-    mode: str
+    pose: str
     prompt: str
 
 
 CALIBRATION_STEPS = [
-    CalibrationStep("thumb", "max", "Now bend your thumb fully."),
-    CalibrationStep("thumb", "min", "Please relax your thumb."),
-    CalibrationStep("index", "max", "Now bend your index finger fully."),
-    CalibrationStep("index", "min", "Please relax your index finger."),
-    CalibrationStep("middle", "max", "Now bend your middle finger fully."),
-    CalibrationStep("middle", "min", "Please relax your middle finger."),
+    CalibrationStep("thumb", "bent", "Now bend your thumb fully."),
+    CalibrationStep("thumb", "relaxed", "Please relax your thumb."),
+    CalibrationStep("index", "bent", "Now bend your index finger fully."),
+    CalibrationStep("index", "relaxed", "Please relax your index finger."),
+    CalibrationStep("middle", "bent", "Now bend your middle finger fully."),
+    CalibrationStep("middle", "relaxed", "Please relax your middle finger."),
 ]
 
 
 class SerialReader(QObject):
-    readings = Signal(int, int, int, float, float, float, float, float, float)
+    readings = Signal(int, int, int)
     status = Signal(str)
 
     def __init__(self, port: str, baud: int):
@@ -165,28 +159,12 @@ class SerialReader(QObject):
                 if not line:
                     continue
                 parts = line.split(",")
-                if len(parts) < 9:
+                if len(parts) < 3:
                     continue
                 thumb = int(float(parts[0]))
                 index = int(float(parts[1]))
                 middle = int(float(parts[2]))
-                ema_roll = float(parts[3])
-                ema_pitch = float(parts[4])
-                yaw = float(parts[5])
-                avg_ax = float(parts[6])
-                avg_ay = float(parts[7])
-                avg_az = float(parts[8])
-                self.readings.emit(
-                    thumb,
-                    index,
-                    middle,
-                    ema_roll,
-                    ema_pitch,
-                    yaw,
-                    avg_ax,
-                    avg_ay,
-                    avg_az,
-                )
+                self.readings.emit(thumb, index, middle)
             except Exception:
                 continue
 
@@ -237,25 +215,43 @@ class MainWindow(QMainWindow):
             "thumb": 0,
             "index": 0,
             "middle": 0,
-            "emaRoll": 0.0,
-            "emaPitch": 0.0,
-            "yaw": 0.0,
-            "avgAx": 0.0,
-            "avgAy": 0.0,
-            "avgAz": 0.0,
         }
         self._calibration: Dict[str, Dict[str, int]] = {
-            "thumb": {"min": 0, "max": 0},
-            "index": {"min": 0, "max": 0},
-            "middle": {"min": 0, "max": 0},
+            "thumb": {
+                "relaxed": 0,
+                "bent": 0,
+                "threshold_on": 0,
+                "threshold_off": 0,
+                "bent_greater": 1,
+            },
+            "index": {
+                "relaxed": 0,
+                "bent": 0,
+                "threshold_on": 0,
+                "threshold_off": 0,
+                "bent_greater": 1,
+            },
+            "middle": {
+                "relaxed": 0,
+                "bent": 0,
+                "threshold_on": 0,
+                "threshold_off": 0,
+                "bent_greater": 1,
+            },
         }
         self._step_index = 0
         self._midi_out = None
         self._last_midi_send = 0.0
-        self._last_midi_values = {}
         self._note_states: Dict[str, bool] = {}
+        self._recent_samples: Dict[str, list[int]] = {
+            "thumb": [],
+            "index": [],
+            "middle": [],
+        }
+        self._is_calibrated = False
 
         self._build_ui()
+        self._load_calibration()
         self._setup_audio()
         self._setup_tts_worker()
         self._setup_midi()
@@ -298,32 +294,8 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(sensor_group)
 
-        imu_group = QGroupBox("IMU Readings")
-        imu_layout = QGridLayout(imu_group)
-        self.roll_label = QLabel("0.00")
-        self.pitch_label = QLabel("0.00")
-        self.yaw_label = QLabel("0.00")
-        self.ax_label = QLabel("0.000")
-        self.ay_label = QLabel("0.000")
-        self.az_label = QLabel("0.000")
-
-        imu_layout.addWidget(QLabel("emaRoll"), 0, 0)
-        imu_layout.addWidget(self.roll_label, 0, 1)
-        imu_layout.addWidget(QLabel("emaPitch"), 1, 0)
-        imu_layout.addWidget(self.pitch_label, 1, 1)
-        imu_layout.addWidget(QLabel("Yaw"), 2, 0)
-        imu_layout.addWidget(self.yaw_label, 2, 1)
-        imu_layout.addWidget(QLabel("avgAx"), 3, 0)
-        imu_layout.addWidget(self.ax_label, 3, 1)
-        imu_layout.addWidget(QLabel("avgAy"), 4, 0)
-        imu_layout.addWidget(self.ay_label, 4, 1)
-        imu_layout.addWidget(QLabel("avgAz"), 5, 0)
-        imu_layout.addWidget(self.az_label, 5, 1)
-
-        layout.addWidget(imu_group)
-
         button_row = QHBoxLayout()
-        self.start_button = QPushButton("Start Calibration")
+        self.start_button = QPushButton("Recalibrate")
         self.capture_button = QPushButton("Capture Step")
         self.capture_button.setEnabled(False)
         button_row.addWidget(self.start_button)
@@ -339,6 +311,77 @@ class MainWindow(QMainWindow):
         self.capture_button.clicked.connect(self._capture_step)
         self.refresh_button.clicked.connect(self._refresh_serial_ports)
         self.connect_button.clicked.connect(self._connect_serial_from_selection)
+
+    def _calibration_path(self) -> str:
+        return os.path.join(os.path.dirname(__file__), CALIBRATION_FILENAME)
+
+    def _default_finger_calibration(self) -> Dict[str, int]:
+        return {
+            "relaxed": 0,
+            "bent": 0,
+            "threshold_on": 0,
+            "threshold_off": 0,
+            "bent_greater": 1,
+        }
+
+    def _is_valid_finger_calibration(self, calib: Dict[str, int]) -> bool:
+        relaxed = int(calib.get("relaxed", 0))
+        bent = int(calib.get("bent", 0))
+        if not (0 <= relaxed <= 1023 and 0 <= bent <= 1023):
+            return False
+        return relaxed != bent
+
+    def _load_calibration(self):
+        path = self._calibration_path()
+        if not os.path.exists(path):
+            self._is_calibrated = False
+            self.step_label.setText("Calibration required. Click Recalibrate to begin.")
+            self._set_status("No calibration file found.")
+            return
+
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                raw = json.load(handle)
+        except Exception as exc:
+            self._is_calibrated = False
+            self.step_label.setText("Calibration file invalid. Click Recalibrate.")
+            self._set_status(f"Failed to load calibration: {exc}")
+            return
+
+        loaded: Dict[str, Dict[str, int]] = {}
+        for finger in ("thumb", "index", "middle"):
+            item = raw.get(finger, {}) if isinstance(raw, dict) else {}
+            finger_data = self._default_finger_calibration()
+
+            # Backward compatibility with older calibration files.
+            if "min" in item and "max" in item:
+                finger_data["relaxed"] = int(item["min"])
+                finger_data["bent"] = int(item["max"])
+
+            for key in (
+                "relaxed",
+                "bent",
+                "threshold_on",
+                "threshold_off",
+                "bent_greater",
+            ):
+                if key in item:
+                    finger_data[key] = int(item[key])
+
+            self._compute_finger_thresholds(finger, finger_data)
+
+            if not self._is_valid_finger_calibration(finger_data):
+                self._is_calibrated = False
+                self.step_label.setText("Calibration invalid. Click Recalibrate.")
+                self._set_status("Calibration file values are invalid.")
+                return
+
+            loaded[finger] = finger_data
+
+        self._calibration = loaded
+        self._is_calibrated = True
+        self.step_label.setText("Calibration loaded. Click Recalibrate to run again.")
+        self._set_status(f"Loaded calibration from {path}")
 
     def _setup_audio(self):
         self.player = QMediaPlayer(self)
@@ -430,82 +473,98 @@ class MainWindow(QMainWindow):
                 return port.device
         return ports[0].device
 
-    @Slot(int, int, int, float, float, float, float, float, float)
+    @Slot(int, int, int)
     def _update_readings(
         self,
         thumb: int,
         index: int,
         middle: int,
-        ema_roll: float,
-        ema_pitch: float,
-        yaw: float,
-        avg_ax: float,
-        avg_ay: float,
-        avg_az: float,
     ):
         self._last_values = (thumb, index, middle)
+        self._recent_samples["thumb"].append(thumb)
+        self._recent_samples["index"].append(index)
+        self._recent_samples["middle"].append(middle)
+        for finger in ("thumb", "index", "middle"):
+            if len(self._recent_samples[finger]) > 25:
+                self._recent_samples[finger] = self._recent_samples[finger][-25:]
+
         self._latest_values.update(
             {
                 "thumb": thumb,
                 "index": index,
                 "middle": middle,
-                "emaRoll": ema_roll,
-                "emaPitch": ema_pitch,
-                "yaw": yaw,
-                "avgAx": avg_ax,
-                "avgAy": avg_ay,
-                "avgAz": avg_az,
             }
         )
         self.thumb_bar.setValue(thumb)
         self.index_bar.setValue(index)
         self.middle_bar.setValue(middle)
-        self.roll_label.setText(f"{ema_roll:.2f}")
-        self.pitch_label.setText(f"{ema_pitch:.2f}")
-        self.yaw_label.setText(f"{yaw:.2f}")
-        self.ax_label.setText(f"{avg_ax:.3f}")
-        self.ay_label.setText(f"{avg_ay:.3f}")
-        self.az_label.setText(f"{avg_az:.3f}")
-        self._send_midi(thumb, index, middle, avg_ax, avg_ay, avg_az)
+        self._send_midi(thumb, index, middle)
 
-    def _normalize_finger(self, finger: str, value: int) -> int:
-        calib = self._calibration.get(finger, {"min": 0, "max": 1023})
-        min_val = calib.get("min", 0)
-        max_val = calib.get("max", 1023)
-        if max_val <= min_val:
-            min_val = 0
-            max_val = 1023
-        return int(round(_clamp((value - min_val) / (max_val - min_val), 0, 1) * 127))
+    def _compute_finger_thresholds(self, finger: str, calib: Dict[str, int]):
+        relaxed = int(calib.get("relaxed", 0))
+        bent = int(calib.get("bent", 0))
+        center = (relaxed + bent) / 2.0
+        span = abs(bent - relaxed)
+        hysteresis = max(8, int(round(span * 0.08)))
+        bent_greater = 1 if bent >= relaxed else 0
+
+        if bent_greater:
+            threshold_on = int(round(center + hysteresis / 2))
+            threshold_off = int(round(center - hysteresis / 2))
+        else:
+            threshold_on = int(round(center - hysteresis / 2))
+            threshold_off = int(round(center + hysteresis / 2))
+
+        calib["threshold_on"] = threshold_on
+        calib["threshold_off"] = threshold_off
+        calib["bent_greater"] = bent_greater
+
+    def _is_finger_bent(self, finger: str, value: int) -> bool:
+        calib = self._calibration.get(finger)
+        if not calib:
+            return False
+
+        is_on = self._note_states.get(finger, False)
+        threshold_on = int(calib.get("threshold_on", 0))
+        threshold_off = int(calib.get("threshold_off", 0))
+        bent_greater = bool(calib.get("bent_greater", 1))
+
+        if bent_greater:
+            if is_on:
+                return value > threshold_off
+            return value >= threshold_on
+
+        if is_on:
+            return value < threshold_off
+        return value <= threshold_on
 
     def _send_midi(
         self,
         thumb: int,
         index: int,
         middle: int,
-        avg_ax: float,
-        avg_ay: float,
-        avg_az: float,
     ):
         if not self._midi_out:
+            return
+        if not self._is_calibrated:
             return
         now = time.monotonic()
         if now - self._last_midi_send < MIDI_SEND_INTERVAL:
             return
         self._last_midi_send = now
 
-        thumb_norm = self._normalize_finger("thumb", thumb) / 127
-        index_norm = self._normalize_finger("index", index) / 127
-        middle_norm = self._normalize_finger("middle", middle) / 127
-
-        self._set_note_state("thumb", thumb_norm >= FINGER_TRIGGER_THRESHOLD)
-        self._set_note_state("index", index_norm >= FINGER_TRIGGER_THRESHOLD)
-        self._set_note_state("middle", middle_norm >= FINGER_TRIGGER_THRESHOLD)
-
-        self._set_note_state("left", avg_ax <= -AXIS_TRIGGER_THRESHOLD)
-        self._set_note_state("right", avg_ax >= AXIS_TRIGGER_THRESHOLD)
-        self._set_note_state("up", avg_ay >= AXIS_TRIGGER_THRESHOLD)
+        self._set_note_state("thumb", self._is_finger_bent("thumb", thumb))
+        self._set_note_state("index", self._is_finger_bent("index", index))
+        self._set_note_state("middle", self._is_finger_bent("middle", middle))
 
     def _start_calibration(self):
+        self._is_calibrated = False
+        self._calibration = {
+            "thumb": self._default_finger_calibration(),
+            "index": self._default_finger_calibration(),
+            "middle": self._default_finger_calibration(),
+        }
+        self._note_states = {}
         self._step_index = 0
         self.capture_button.setEnabled(True)
         self._advance_step()
@@ -527,12 +586,22 @@ class MainWindow(QMainWindow):
         if self._step_index >= len(CALIBRATION_STEPS):
             return
         step = CALIBRATION_STEPS[self._step_index]
-        value = {
-            "thumb": self._last_values[0],
-            "index": self._last_values[1],
-            "middle": self._last_values[2],
-        }[step.finger]
-        self._calibration[step.finger][step.mode] = value
+        samples = self._recent_samples[step.finger]
+        if len(samples) < MIN_CALIBRATION_SAMPLES:
+            self._set_status(
+                f"Hold pose steady for {step.finger} (need {MIN_CALIBRATION_SAMPLES} samples)."
+            )
+            return
+        if samples:
+            value = int(round(sum(samples) / len(samples)))
+        else:
+            value = {
+                "thumb": self._last_values[0],
+                "index": self._last_values[1],
+                "middle": self._last_values[2],
+            }[step.finger]
+
+        self._calibration[step.finger][step.pose] = value
         self._step_index += 1
         if self._step_index >= len(CALIBRATION_STEPS):
             self.capture_button.setEnabled(False)
@@ -542,6 +611,7 @@ class MainWindow(QMainWindow):
 
     def _advance_step(self):
         step = CALIBRATION_STEPS[self._step_index]
+        self._recent_samples[step.finger] = []
         self.step_label.setText(
             f"Step {self._step_index + 1}/{len(CALIBRATION_STEPS)}: {step.prompt}"
         )
@@ -559,13 +629,26 @@ class MainWindow(QMainWindow):
         self._set_status("Playing instruction...")
 
     def _finish_calibration(self):
+        for finger in ("thumb", "index", "middle"):
+            self._compute_finger_thresholds(finger, self._calibration[finger])
+
+        if not all(
+            self._is_valid_finger_calibration(self._calibration[finger])
+            for finger in ("thumb", "index", "middle")
+        ):
+            self._is_calibrated = False
+            self.step_label.setText("Calibration failed. Click Recalibrate.")
+            self._set_status("Calibration failed: finger ranges are invalid.")
+            return
+
+        self._is_calibrated = True
         self.step_label.setText("Calibration complete")
         self._set_status("Calibration complete. Saving results...")
         self._save_calibration()
         self._speak("Calibration complete.")
 
     def _save_calibration(self):
-        file_path = os.path.join(os.getcwd(), "calibration.json")
+        file_path = self._calibration_path()
         with open(file_path, "w", encoding="utf-8") as handle:
             json.dump(self._calibration, handle, indent=2)
         self._set_status(f"Saved calibration to {file_path}")
