@@ -1,3 +1,7 @@
+// Ultrasonic (HC-SR04)
+const uint8_t PIN_US_TRIG = 7;
+const uint8_t PIN_US_ECHO = 8;
+
 // Pins
 const uint8_t PIN_FLEX_THUMB = A0;
 const uint8_t PIN_FLEX_INDEX = A1;
@@ -7,6 +11,24 @@ const uint8_t LED_PIN = 13;
 // Calibration data
 int flexMin[3] = {1023, 1023, 1023};
 int flexMax[3] = {0, 0, 0};
+
+float readDistanceCm()
+{
+    digitalWrite(PIN_US_TRIG, LOW);
+    delayMicroseconds(2);
+    digitalWrite(PIN_US_TRIG, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(PIN_US_TRIG, LOW);
+
+    // Timeout after ~30ms (~5m round trip) so loop doesn't stall.
+    unsigned long duration = pulseIn(PIN_US_ECHO, HIGH, 30000UL);
+    if (duration == 0)
+    {
+        return NAN;
+    }
+
+    return (duration * 0.0343f) / 2.0f;
+}
 
 void calibrateFlexSensors()
 {
@@ -41,6 +63,9 @@ void setup()
 {
     pinMode(LED_PIN, OUTPUT);
     digitalWrite(LED_PIN, LOW);
+    pinMode(PIN_US_TRIG, OUTPUT);
+    pinMode(PIN_US_ECHO, INPUT);
+    digitalWrite(PIN_US_TRIG, LOW);
 
     Serial.begin(115200);
     Serial.println("---AeroMix---");
@@ -53,10 +78,22 @@ void loop()
     int rawThumb = analogRead(PIN_FLEX_THUMB);
     int rawIndex = analogRead(PIN_FLEX_INDEX);
     int rawMiddle = analogRead(PIN_FLEX_MIDDLE);
+    float distanceCm = readDistanceCm();
 
     Serial.print(rawThumb);
     Serial.print(',');
     Serial.print(rawIndex);
     Serial.print(',');
-    Serial.println(rawMiddle);
+    Serial.print(rawMiddle);
+    Serial.print(',');
+    if (isnan(distanceCm))
+    {
+        Serial.println("nan");
+    }
+    else
+    {
+        Serial.println(distanceCm, 1);
+    }
+
+    delay(10);
 }

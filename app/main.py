@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import sys
 import threading
@@ -39,9 +40,12 @@ MIDI_DEFAULT_PORT = "AeroMix"
 MIDI_CHANNEL = 0
 MIDI_SEND_INTERVAL = 0.03
 MIDI_VOLUME_CC = 7
-MIDI_VOLUME_NEUTRAL_CC = 32
+MIDI_VOLUME_NEUTRAL_CC = 112
 MIDI_VOLUME_MIN_CC = 0
 MIDI_REVERB_CC = 12
+MIDI_TEMPO_CC = 13
+MIDI_PAUSE_CC = 14
+MIDI_VINTAGE_TOGGLE_CC = 15
 THUMB_MEDIAN_WINDOW = 5
 THUMB_EMA_ALPHA = 0.3
 THUMB_CC_DEADBAND = 1
@@ -51,6 +55,24 @@ INDEX_EFFECT_MEDIAN_WINDOW = 5
 INDEX_EFFECT_EMA_ALPHA = 0.3
 INDEX_EFFECT_CC_DEADBAND = 1
 INDEX_EFFECT_CC_SLEW_PER_SEC = 160.0
+ULTRASONIC_VALID_MIN_CM = 1.0
+ULTRASONIC_VALID_MAX_CM = 220.0
+ULTRASONIC_PALM_UP_CM = 2.0
+ULTRASONIC_PALM_UP_SAMPLES = 3
+ULTRASONIC_RECOVER_SAMPLES = 2
+ENABLE_ULTRASONIC_PAUSE = False
+# Sitting setup (right-hand sensor bouncing off left hand):
+# at/above this distance, tempo is neutral; closer than this gradually slows.
+TEMPO_NORMAL_DISTANCE_CM = 30.0
+TEMPO_NO_CHANGE_BELOW_CM = 3.0
+TEMPO_NEUTRAL_CC = 90
+TEMPO_SLOW_CC = 10
+TEMPO_MEDIAN_WINDOW = 5
+TEMPO_EMA_ALPHA = 0.25
+TEMPO_CC_DEADBAND = 1
+TEMPO_CC_SLEW_PER_SEC = 120.0
+MIDDLE_VINTAGE_EXTRA_BEND_RATIO = 0.05
+MIDDLE_VINTAGE_EXTRA_BEND_MIN = 20
 DEBUG_NOTES_ENABLED = False
 CALIBRATION_FILENAME = "calibration.json"
 # DJ effect CC mappings (disabled for now)
@@ -117,6 +139,14 @@ class MidiOutput:
         )
         self._out.send(message)
 
+    def send_realtime(self, kind: str):
+        if not self._out:
+            return
+        if kind not in ("start", "stop", "continue"):
+            return
+        message = mido.Message(kind)
+        self._out.send(message)
+
     def close(self):
         if self._out:
             try:
@@ -144,7 +174,7 @@ CALIBRATION_STEPS = [
 
 
 class SerialReader(QObject):
-    readings = Signal(int, int, int)
+    readings = Signal(int, int, int, float)
     status = Signal(str)
 
     def __init__(self, port: str, baud: int):
@@ -153,6 +183,9 @@ class SerialReader(QObject):
         self._baud = baud
         self._running = False
         self._ser: Optional[serial.Serial] = None
+        self._last_thumb = 0
+        self._last_index = 0
+        self._last_middle = 0
 
     def start(self):
         self._running = True
@@ -171,13 +204,46 @@ class SerialReader(QObject):
                 line = self._ser.readline().decode(errors="ignore").strip()
                 if not line:
                     continue
-                parts = line.split(",")
-                if len(parts) < 3:
+                lower = line.lower()
+
+                if "," in line:
+                    parts = [part.strip() for part in line.split(",")]
+                    if len(parts) < 3:
+                        continue
+                    thumb = int(float(parts[0]))
+                    index = int(float(parts[1]))
+                    middle = int(float(parts[2]))
+                    distance = float("nan")
+                    if len(parts) >= 4:
+                        distance = float(parts[3])
+
+                    self._last_thumb = thumb
+                    self._last_index = index
+                    self._last_middle = middle
+                    self.readings.emit(thumb, index, middle, distance)
                     continue
-                thumb = int(float(parts[0]))
-                index = int(float(parts[1]))
-                middle = int(float(parts[2]))
-                self.readings.emit(thumb, index, middle)
+
+                if "distance" in lower:
+                    value_text = line.split(":")[-1].strip()
+                    distance = float(value_text)
+                    self.readings.emit(
+                        self._last_thumb,
+                        self._last_index,
+                        self._last_middle,
+                        distance,
+                    )
+                    continue
+
+                try:
+                    distance = float(line)
+                except ValueError:
+                    continue
+                self.readings.emit(
+                    self._last_thumb,
+                    self._last_index,
+                    self._last_middle,
+                    distance,
+                )
             except Exception:
                 continue
 
@@ -228,6 +294,7 @@ class MainWindow(QMainWindow):
             "thumb": 0,
             "index": 0,
             "middle": 0,
+            "distance": 0,
         }
         self._calibration: Dict[str, Dict[str, int]] = {
             "thumb": {
@@ -263,6 +330,15 @@ class MainWindow(QMainWindow):
         self._echo_cc_ema: Optional[float] = None
         self._echo_cc_slew: Optional[float] = None
         self._echo_cc_history: Deque[int] = deque(maxlen=INDEX_EFFECT_MEDIAN_WINDOW)
+        self._last_tempo_cc: Optional[int] = None
+        self._tempo_cc_ema: Optional[float] = None
+        self._tempo_cc_slew: Optional[float] = None
+        self._tempo_cc_history: Deque[int] = deque(maxlen=TEMPO_MEDIAN_WINDOW)
+        self._transport_paused = False
+        self._no_distance_streak = 0
+        self._distance_recover_streak = 0
+        self._middle_bent_state = False
+        self._vintage_enabled = False
         self._note_states: Dict[str, bool] = {}
         self._recent_samples: Dict[str, list[int]] = {
             "thumb": [],
@@ -306,12 +382,18 @@ class MainWindow(QMainWindow):
         for bar in (self.thumb_bar, self.index_bar, self.middle_bar):
             bar.setRange(0, 1023)
 
+        self.distance_bar = QProgressBar()
+        self.distance_bar.setRange(0, int(round(ULTRASONIC_VALID_MAX_CM)))
+        self.distance_bar.setFormat("%v cm")
+
         sensor_layout.addWidget(QLabel("Thumb"), 0, 0)
         sensor_layout.addWidget(self.thumb_bar, 0, 1)
         sensor_layout.addWidget(QLabel("Index"), 1, 0)
         sensor_layout.addWidget(self.index_bar, 1, 1)
         sensor_layout.addWidget(QLabel("Middle"), 2, 0)
         sensor_layout.addWidget(self.middle_bar, 2, 1)
+        sensor_layout.addWidget(QLabel("Distance"), 3, 0)
+        sensor_layout.addWidget(self.distance_bar, 3, 1)
 
         layout.addWidget(sensor_group)
 
@@ -504,12 +586,13 @@ class MainWindow(QMainWindow):
                 return port.device
         return ports[0].device
 
-    @Slot(int, int, int)
+    @Slot(int, int, int, float)
     def _update_readings(
         self,
         thumb: int,
         index: int,
         middle: int,
+        distance: float,
     ):
         self._last_values = (thumb, index, middle)
         self._recent_samples["thumb"].append(thumb)
@@ -524,12 +607,20 @@ class MainWindow(QMainWindow):
                 "thumb": thumb,
                 "index": index,
                 "middle": middle,
+                "distance": int(round(distance)) if math.isfinite(distance) else 0,
             }
         )
         self.thumb_bar.setValue(thumb)
         self.index_bar.setValue(index)
         self.middle_bar.setValue(middle)
-        self._send_midi(thumb, index, middle)
+        if math.isfinite(distance):
+            distance_cm = int(round(_clamp(distance, 0.0, ULTRASONIC_VALID_MAX_CM)))
+            self.distance_bar.setValue(distance_cm)
+            self.distance_bar.setFormat(f"{distance_cm} cm")
+        else:
+            self.distance_bar.setValue(0)
+            self.distance_bar.setFormat("No echo")
+        self._send_midi(thumb, index, middle, distance)
 
     def _compute_finger_thresholds(self, finger: str, calib: Dict[str, int]):
         relaxed = int(calib.get("relaxed", 0))
@@ -574,6 +665,7 @@ class MainWindow(QMainWindow):
         thumb: int,
         index: int,
         middle: int,
+        distance: float,
     ):
         if not self._midi_out:
             return
@@ -595,8 +687,79 @@ class MainWindow(QMainWindow):
             self._midi_out.send_cc(MIDI_REVERB_CC, echo_cc)
             self._last_echo_cc = echo_cc
 
+        if ENABLE_ULTRASONIC_PAUSE:
+            self._handle_transport_pause(distance)
+        tempo_cc = self._ultrasonic_tempo_cc(distance, elapsed)
+        if tempo_cc is not None and tempo_cc != self._last_tempo_cc:
+            self._midi_out.send_cc(MIDI_TEMPO_CC, tempo_cc)
+            self._last_tempo_cc = tempo_cc
+
+        self._handle_middle_vintage_toggle(middle)
+
         if DEBUG_NOTES_ENABLED:
             self._set_note_state("middle", self._is_finger_bent("middle", middle))
+
+    def _is_bent_with_hysteresis(self, finger: str, value: int, is_on: bool) -> bool:
+        calib = self._calibration.get(finger)
+        if not calib:
+            return False
+
+        threshold_on = int(calib.get("threshold_on", 0))
+        threshold_off = int(calib.get("threshold_off", 0))
+        bent_greater = bool(calib.get("bent_greater", 1))
+
+        if bent_greater:
+            if is_on:
+                return value > threshold_off
+            return value >= threshold_on
+
+        if is_on:
+            return value < threshold_off
+        return value <= threshold_on
+
+    def _handle_middle_vintage_toggle(self, middle_value: int):
+        if not self._midi_out:
+            return
+
+        bent_now = self._is_middle_vintage_bent(middle_value, self._middle_bent_state)
+        if bent_now and not self._middle_bent_state:
+            self._vintage_enabled = not self._vintage_enabled
+            self._midi_out.send_cc(
+                MIDI_VINTAGE_TOGGLE_CC,
+                127 if self._vintage_enabled else 0,
+            )
+
+        self._middle_bent_state = bent_now
+
+    def _is_middle_vintage_bent(self, value: int, is_on: bool) -> bool:
+        calib = self._calibration.get("middle")
+        if not calib:
+            return False
+
+        relaxed = int(calib.get("relaxed", 0))
+        bent = int(calib.get("bent", 0))
+        bent_greater = bool(calib.get("bent_greater", 1))
+        threshold_on = int(calib.get("threshold_on", 0))
+        threshold_off = int(calib.get("threshold_off", 0))
+
+        span = abs(bent - relaxed)
+        extra = max(
+            MIDDLE_VINTAGE_EXTRA_BEND_MIN,
+            int(round(span * MIDDLE_VINTAGE_EXTRA_BEND_RATIO)),
+        )
+
+        if bent_greater:
+            threshold_on += extra
+            threshold_off += extra
+            if is_on:
+                return value > threshold_off
+            return value >= threshold_on
+
+        threshold_on -= extra
+        threshold_off -= extra
+        if is_on:
+            return value < threshold_off
+        return value <= threshold_on
 
     def _finger_curl_amount(self, finger: str, finger_value: int) -> Optional[float]:
         calib = self._calibration.get(finger)
@@ -703,6 +866,92 @@ class MainWindow(QMainWindow):
 
         return cc_value
 
+    def _set_transport_paused(self, paused: bool):
+        if not self._midi_out:
+            return
+        if self._transport_paused == paused:
+            return
+
+        self._transport_paused = paused
+        self._midi_out.send_cc(MIDI_PAUSE_CC, 127 if paused else 0)
+        self._midi_out.send_realtime("stop" if paused else "start")
+
+    def _handle_transport_pause(self, distance: float):
+        has_distance = math.isfinite(distance) and distance >= ULTRASONIC_VALID_MIN_CM
+        palm_up = (not has_distance) or (distance <= ULTRASONIC_PALM_UP_CM)
+
+        if palm_up:
+            self._no_distance_streak += 1
+            self._distance_recover_streak = 0
+        else:
+            self._distance_recover_streak += 1
+            self._no_distance_streak = 0
+
+        if (
+            not self._transport_paused
+            and self._no_distance_streak >= ULTRASONIC_PALM_UP_SAMPLES
+        ):
+            self._set_transport_paused(True)
+        elif (
+            self._transport_paused
+            and self._distance_recover_streak >= ULTRASONIC_RECOVER_SAMPLES
+        ):
+            self._set_transport_paused(False)
+
+    def _ultrasonic_tempo_cc(self, distance: float, elapsed: float) -> Optional[int]:
+        if not math.isfinite(distance):
+            return None
+        if distance < ULTRASONIC_VALID_MIN_CM or distance > ULTRASONIC_VALID_MAX_CM:
+            return None
+
+        # Hand-to-hand baseline: at/above the lower threshold is neutral tempo.
+        # Only when the hands move closer than that threshold does slowdown begin.
+        slowdown_start = max(
+            ULTRASONIC_VALID_MIN_CM,
+            TEMPO_NORMAL_DISTANCE_CM - TEMPO_NO_CHANGE_BELOW_CM,
+        )
+        if distance >= slowdown_start:
+            normalized = 0.0
+        else:
+            span = max(1.0, slowdown_start - ULTRASONIC_VALID_MIN_CM)
+            normalized = (slowdown_start - distance) / span
+
+        normalized = _clamp(normalized, 0.0, 1.0)
+        raw_cc = int(
+            round(TEMPO_NEUTRAL_CC + normalized * (TEMPO_SLOW_CC - TEMPO_NEUTRAL_CC))
+        )
+
+        self._tempo_cc_history.append(raw_cc)
+        median_cc = sorted(self._tempo_cc_history)[len(self._tempo_cc_history) // 2]
+
+        if self._tempo_cc_ema is None:
+            self._tempo_cc_ema = float(median_cc)
+        else:
+            self._tempo_cc_ema = (
+                TEMPO_EMA_ALPHA * float(median_cc)
+                + (1.0 - TEMPO_EMA_ALPHA) * self._tempo_cc_ema
+            )
+
+        target = self._tempo_cc_ema
+        if self._tempo_cc_slew is None:
+            self._tempo_cc_slew = target
+        else:
+            max_delta = TEMPO_CC_SLEW_PER_SEC * max(0.0, min(elapsed, 0.2))
+            delta = target - self._tempo_cc_slew
+            if delta > max_delta:
+                delta = max_delta
+            elif delta < -max_delta:
+                delta = -max_delta
+            self._tempo_cc_slew += delta
+
+        cc_value = int(round(_clamp(self._tempo_cc_slew, 0.0, 127.0)))
+        if (
+            self._last_tempo_cc is not None
+            and abs(cc_value - self._last_tempo_cc) < TEMPO_CC_DEADBAND
+        ):
+            return self._last_tempo_cc
+        return cc_value
+
     def _start_calibration(self):
         self._is_calibrated = False
         self._calibration = {
@@ -718,6 +967,15 @@ class MainWindow(QMainWindow):
         self._echo_cc_ema = None
         self._echo_cc_slew = None
         self._echo_cc_history.clear()
+        self._last_tempo_cc = None
+        self._tempo_cc_ema = None
+        self._tempo_cc_slew = None
+        self._tempo_cc_history.clear()
+        self._transport_paused = False
+        self._no_distance_streak = 0
+        self._distance_recover_streak = 0
+        self._middle_bent_state = False
+        self._vintage_enabled = False
         self._note_states = {}
         self._step_index = 0
         self.capture_button.setEnabled(True)
